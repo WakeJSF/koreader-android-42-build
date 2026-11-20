@@ -1,7 +1,7 @@
 name: Build KOReader Android 4.2 APK
 
-# 取官方 v2026.07.1 的 armeabi-v7a APK，仅把清单里的 minSdkVersion 从 18 改成 17，
-# 然后重新对齐 + 签名。不重新编译原生代码，所以几分钟就能出结果。
+# 不改源码、不重编译：直接解析官方 APK 的二进制 AndroidManifest.xml，
+# 把 uses-sdk 里的 minSdkVersion 改成 17，然后 zipalign + 重签名。
 
 on:
   workflow_dispatch:
@@ -35,71 +35,174 @@ jobs:
       MIN_SDK: ${{ github.event.inputs.target_min_sdk || '17' }}
 
     steps:
-      - name: 安装 Java 与基础工具
+      - name: 安装 Java 与签名工具
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq openjdk-17-jdk-headless unzip wget zip > /dev/null
+          sudo apt-get install -y -qq zipalign apksigner unzip wget > /dev/null
+          sudo apt-get install -y -qq openjdk-17-jdk-headless > /dev/null || echo "跳过 openjdk（runner 通常已自带 Java 17）"
           java -version
+          command -v zipalign > /dev/null && echo "zipalign OK" || echo "zipalign MISSING"
+          apksigner version || echo "apksigner MISSING"
 
       - name: 下载官方 APK (armeabi-v7a, 32 位 ARM)
         run: |
           URL="https://github.com/koreader/koreader/releases/download/${VERSION}/koreader-android-arm-${VERSION}.apk"
           echo "Download: $URL"
-          wget -q --tries=3 --timeout=60 "$URL" -O original.apk
+          wget -q --tries=3 --timeout=120 "$URL" -O original.apk
           ls -lh original.apk
+          unzip -l original.apk | head -20 || true
 
-      - name: 下载 apktool
+      - name: 写入 AXML 补丁脚本
         run: |
-          wget -q --tries=3 https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
-          ls -lh apktool.jar
+          cat > axml.py <<'PY'
+          import sys, struct, zipfile
 
-      - name: 反编译（只解资源与清单，dex 原样保留）
-        run: |
-          java -jar apktool.jar d -f -s original.apk -o decoded
-          echo "=== 原始 minSdkVersion ==="
-          grep -o 'minSdkVersion="[0-9]*"' decoded/AndroidManifest.xml || echo "(not found)"
+          TYPE_STRING_POOL = 0x0001
+          TYPE_START_ELEMENT = 0x0102
+
+          def _varint(buf, p):
+              n = buf[p]; p += 1
+              if n & 0x80:
+                  n = ((n & 0x7f) << 8) | buf[p]; p += 1
+              return n, p
+
+          def read_string_pool(data, off):
+              _, hsize, _ = struct.unpack_from('<HHI', data, off)
+              count, _, flags, strings_start, _ = struct.unpack_from('<IIIII', data, off + 8)
+              utf8 = bool(flags & 0x100)
+              offsets = struct.unpack_from('<%dI' % count, data, off + hsize)
+              base = off + strings_start
+              out = []
+              for o in offsets:
+                  p = base + o
+                  if utf8:
+                      _, p = _varint(data, p)
+                      m, p = _varint(data, p)
+                      out.append(data[p:p + m].decode('utf-8', 'replace'))
+                  else:
+                      n = struct.unpack_from('<H', data, p)[0]; p += 2
+                      if n & 0x8000:
+                          n = ((n & 0x7fff) << 16) | struct.unpack_from('<H', data, p)[0]; p += 2
+                      out.append(data[p:p + n * 2].decode('utf-16-le', 'replace'))
+              return out
+
+          def scan(data, verbose=True):
+              strings = []
+              found = []
+              off = 8
+              while off + 8 <= len(data):
+                  ctype, hsize, csize = struct.unpack_from('<HHI', data, off)
+                  if csize <= 0:
+                      break
+                  if ctype == TYPE_STRING_POOL:
+                      strings = read_string_pool(data, off)
+                  elif ctype == TYPE_START_ELEMENT:
+                      name_idx = struct.unpack_from('<I', data, off + hsize + 4)[0]
+                      if name_idx < len(strings) and strings[name_idx] == 'uses-sdk':
+                          attr_start, attr_size, attr_count = struct.unpack_from('<HHH', data, off + hsize + 8)
+                          ap = off + hsize + attr_start
+                          for i in range(attr_count):
+                              a = ap + i * attr_size
+                              _, aname_idx, _ = struct.unpack_from('<III', data, a)
+                              _, _, dtype, dval = struct.unpack_from('<HBBI', data, a + 12)
+                              aname = strings[aname_idx] if aname_idx < len(strings) else ('#%d' % aname_idx)
+                              found.append((aname, dtype, dval, a + 16))
+                              if verbose:
+                                  print('  uses-sdk / %s = %s (type=0x%02x)' % (aname, dval, dtype))
+                  off += csize
+              return found
+
+          def dump(apk):
+              with zipfile.ZipFile(apk) as z:
+                  data = z.read('AndroidManifest.xml')
+              print('AndroidManifest.xml 大小: %d 字节' % len(data))
+              print('uses-sdk 属性:')
+              res = scan(data)
+              if not res:
+                  print('  (没有找到 uses-sdk 元素)')
+              return res
+
+          def patch(apk, out, sdk):
+              with zipfile.ZipFile(apk) as z:
+                  data = bytearray(z.read('AndroidManifest.xml'))
+                  print('原始 uses-sdk:')
+                  res = scan(data)
+                  if not res:
+                      print('  (没有找到 uses-sdk 元素，无法修改)')
+                      sys.exit(1)
+                  hit = False
+                  for aname, dtype, dval, pos in res:
+                      if aname == 'minSdkVersion':
+                          struct.pack_into('<I', data, pos, sdk)
+                          hit = True
+                  if not hit:
+                      print('  没有 minSdkVersion 属性')
+                      sys.exit(1)
+                  print('已把 minSdkVersion 改为 %d' % sdk)
+                  print('修改后 uses-sdk:')
+                  scan(data)
+
+                  with zipfile.ZipFile(out, 'w') as zo:
+                      skipped = 0
+                      for info in z.infolist():
+                          name = info.filename
+                          base = name.split('/')[-1].upper()
+                          if name.startswith('META-INF/') and (
+                                  base == 'MANIFEST.MF' or base.endswith('.SF')
+                                  or base.endswith('.RSA') or base.endswith('.DSA')
+                                  or base.endswith('.EC')):
+                              skipped += 1
+                              continue
+                          blob = z.read(info.filename)
+                          if info.filename == 'AndroidManifest.xml':
+                              blob = bytes(data)
+                          ni = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                          ni.compress_type = info.compress_type
+                          ni.external_attr = info.external_attr
+                          zo.writestr(ni, blob)
+                      print('已剔除旧签名文件 %d 个' % skipped)
+              print('已输出: %s' % out)
+
+          if __name__ == '__&#8203;main__':
+              cmd = sys.argv[1]
+              if cmd == 'dump':
+                  dump(sys.argv[2])
+              elif cmd == 'patch':
+                  patch(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+              else:
+                  sys.exit('unknown cmd')
+          PY
+          python3 -c "import ast; ast.parse(open('axml.py',encoding='utf-8').read()); print('脚本语法 OK')"
+
+      - name: 查看原始 minSdkVersion
+        run: python3 axml.py dump original.apk
 
       - name: 修改 minSdkVersion
-        run: |
-          sed -i "s/minSdkVersion=\"[0-9]*\"/minSdkVersion=\"${MIN_SDK}\"/" decoded/AndroidManifest.xml
-          echo "=== 修改后 minSdkVersion ==="
-          grep -o 'minSdkVersion="[0-9]*"' decoded/AndroidManifest.xml
-
-      - name: 重新打包
-        run: |
-          java -jar apktool.jar b decoded -o unsigned.apk
-          ls -lh unsigned.apk
+        run: python3 axml.py patch original.apk patched.apk "${MIN_SDK}"
 
       - name: 对齐与签名
         run: |
-          sudo apt-get install -y -qq zipalign apksigner > /dev/null 2>&1 || true
-
           keytool -genkeypair -keystore ks.jks \
             -storepass koreader42 -keypass koreader42 \
             -alias koreader42 -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=KOReader Android 4.2 Build" > /dev/null 2>&1
 
           OUT="koreader-android-arm-${VERSION}-android4.2.apk"
-
-          if command -v zipalign > /dev/null 2>&1 && command -v apksigner > /dev/null 2>&1; then
-            echo "用 zipalign + apksigner"
-            zipalign -p -f 4 unsigned.apk aligned.apk
-            apksigner sign --ks ks.jks --ks-pass pass:koreader42 --key-pass pass:koreader42 \
-              --min-sdk-version "${MIN_SDK}" --out "$OUT" aligned.apk
-            apksigner verify --min-sdk-version "${MIN_SDK}" --print-certs "$OUT" | head -20
-          else
-            echo "系统包不可用，改用 jarsigner（v1 签名，Android 4.2 可用）"
-            cp unsigned.apk "$OUT"
-            jarsigner -keystore ks.jks -storepass koreader42 -keypass koreader42 \
-              "$OUT" koreader42
-          fi
-
+          zipalign -p -f 4 patched.apk aligned.apk
+          apksigner sign --ks ks.jks --ks-pass pass:koreader42 --key-pass pass:koreader42 \
+            --min-sdk-version "${MIN_SDK}" --out "$OUT" aligned.apk
+          echo "=== 签名校验 ==="
+          apksigner verify --min-sdk-version "${MIN_SDK}" --verbose --print-certs "$OUT" | head -25 || true
+          echo "=== 最终 APK ==="
           ls -lh "$OUT"
+
+      - name: 复检最终 APK 的 minSdkVersion
+        run: python3 axml.py dump koreader-android-arm-*-android4.2.apk
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
           name: koreader-android42-${{ env.VERSION }}
-          path: koreader-*.apk
+          path: koreader-android-arm-*-android4.2.apk
           if-no-files-found: error
           retention-days: 30
