@@ -1,0 +1,105 @@
+name: Build KOReader Android 4.2 APK
+
+# 取官方 v2026.07.1 的 armeabi-v7a APK，仅把清单里的 minSdkVersion 从 18 改成 17，
+# 然后重新对齐 + 签名。不重新编译原生代码，所以几分钟就能出结果。
+
+on:
+  workflow_dispatch:
+    inputs:
+      koreader_version:
+        description: 'KOReader 版本号（如 v2026.07.1）'
+        required: true
+        default: 'v2026.07.1'
+      target_min_sdk:
+        description: '目标 minSdkVersion（17 = Android 4.2）'
+        required: true
+        default: '17'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/build-android.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Patch APK for Android 4.2
+    runs-on: ubuntu-22.04
+
+    env:
+      VERSION: ${{ github.event.inputs.koreader_version || 'v2026.07.1' }}
+      MIN_SDK: ${{ github.event.inputs.target_min_sdk || '17' }}
+
+    steps:
+      - name: 安装 Java 与基础工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openjdk-17-jdk-headless unzip wget zip > /dev/null
+          java -version
+
+      - name: 下载官方 APK (armeabi-v7a, 32 位 ARM)
+        run: |
+          URL="https://github.com/koreader/koreader/releases/download/${VERSION}/koreader-android-arm-${VERSION}.apk"
+          echo "Download: $URL"
+          wget -q --tries=3 --timeout=60 "$URL" -O original.apk
+          ls -lh original.apk
+
+      - name: 下载 apktool
+        run: |
+          wget -q --tries=3 https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          ls -lh apktool.jar
+
+      - name: 反编译（只解资源与清单，dex 原样保留）
+        run: |
+          java -jar apktool.jar d -f -s original.apk -o decoded
+          echo "=== 原始 minSdkVersion ==="
+          grep -o 'minSdkVersion="[0-9]*"' decoded/AndroidManifest.xml || echo "(not found)"
+
+      - name: 修改 minSdkVersion
+        run: |
+          sed -i "s/minSdkVersion=\"[0-9]*\"/minSdkVersion=\"${MIN_SDK}\"/" decoded/AndroidManifest.xml
+          echo "=== 修改后 minSdkVersion ==="
+          grep -o 'minSdkVersion="[0-9]*"' decoded/AndroidManifest.xml
+
+      - name: 重新打包
+        run: |
+          java -jar apktool.jar b decoded -o unsigned.apk
+          ls -lh unsigned.apk
+
+      - name: 对齐与签名
+        run: |
+          sudo apt-get install -y -qq zipalign apksigner > /dev/null 2>&1 || true
+
+          keytool -genkeypair -keystore ks.jks \
+            -storepass koreader42 -keypass koreader42 \
+            -alias koreader42 -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=KOReader Android 4.2 Build" > /dev/null 2>&1
+
+          OUT="koreader-android-arm-${VERSION}-android4.2.apk"
+
+          if command -v zipalign > /dev/null 2>&1 && command -v apksigner > /dev/null 2>&1; then
+            echo "用 zipalign + apksigner"
+            zipalign -p -f 4 unsigned.apk aligned.apk
+            apksigner sign --ks ks.jks --ks-pass pass:koreader42 --key-pass pass:koreader42 \
+              --min-sdk-version "${MIN_SDK}" --out "$OUT" aligned.apk
+            apksigner verify --min-sdk-version "${MIN_SDK}" --print-certs "$OUT" | head -20
+          else
+            echo "系统包不可用，改用 jarsigner（v1 签名，Android 4.2 可用）"
+            cp unsigned.apk "$OUT"
+            jarsigner -keystore ks.jks -storepass koreader42 -keypass koreader42 \
+              "$OUT" koreader42
+          fi
+
+          ls -lh "$OUT"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: koreader-android42-${{ env.VERSION }}
+          path: koreader-*.apk
+          if-no-files-found: error
+          retention-days: 30
