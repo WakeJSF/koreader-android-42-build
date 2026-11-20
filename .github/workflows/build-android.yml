@@ -1,7 +1,7 @@
 name: Build KOReader Android 4.2 APK
 
-# 不改源码、不重编译：直接解析官方 APK 的二进制 AndroidManifest.xml，
-# 把 uses-sdk 里的 minSdkVersion 改成 17，然后 zipalign + 重签名。
+# 不改源码、不重编译：解包官方 APK，改二进制 AndroidManifest.xml 里的 minSdkVersion，
+# 用系统 zip 重新打包，再 zipalign + 重签名。
 
 on:
   workflow_dispatch:
@@ -35,27 +35,30 @@ jobs:
       MIN_SDK: ${{ github.event.inputs.target_min_sdk || '17' }}
 
     steps:
-      - name: 安装 Java 与签名工具
+      - name: 1-安装工具
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq zipalign apksigner unzip wget > /dev/null
-          sudo apt-get install -y -qq openjdk-17-jdk-headless > /dev/null || echo "跳过 openjdk（runner 通常已自带 Java 17）"
-          java -version
-          command -v zipalign > /dev/null && echo "zipalign OK" || echo "zipalign MISSING"
-          apksigner version || echo "apksigner MISSING"
+          sudo apt-get install -y -qq zipalign apksigner unzip zip wget > /dev/null
+          echo "--- 工具检查 ---"
+          command -v unzip && command -v zip && command -v zipalign && command -v apksigner
+          java -version 2>&1 | head -3
 
-      - name: 下载官方 APK (armeabi-v7a, 32 位 ARM)
+      - name: 2-下载官方APK并解包
         run: |
           URL="https://github.com/koreader/koreader/releases/download/${VERSION}/koreader-android-arm-${VERSION}.apk"
           echo "Download: $URL"
-          wget -q --tries=3 --timeout=120 "$URL" -O original.apk
-          ls -lh original.apk
-          unzip -l original.apk | head -20 || true
+          wget -q --tries=3 --timeout=180 "$URL" -O original.apk
+          ls -l original.apk
+          unzip -l original.apk | head -6
+          rm -rf apk && mkdir -p apk
+          unzip -q -o original.apk -d apk || echo "解包有警告（继续）"
+          echo "解包文件数: $(find apk -type f | wc -l)"
+          ls -l apk/AndroidManifest.xml
 
-      - name: 写入 AXML 补丁脚本
+      - name: 3-写入AXML补丁脚本
         run: |
           cat > axml.py <<'PY'
-          import sys, struct, zipfile
+          import sys, struct
 
           TYPE_STRING_POOL = 0x0001
           TYPE_START_ELEMENT = 0x0102
@@ -86,13 +89,13 @@ jobs:
                       out.append(data[p:p + n * 2].decode('utf-16-le', 'replace'))
               return out
 
-          def scan(data, verbose=True):
+          def scan(data):
               strings = []
               found = []
               off = 8
               while off + 8 <= len(data):
                   ctype, hsize, csize = struct.unpack_from('<HHI', data, off)
-                  if csize <= 0:
+                  if csize < 8:
                       break
                   if ctype == TYPE_STRING_POOL:
                       strings = read_string_pool(data, off)
@@ -107,99 +110,112 @@ jobs:
                               _, _, dtype, dval = struct.unpack_from('<HBBI', data, a + 12)
                               aname = strings[aname_idx] if aname_idx < len(strings) else ('#%d' % aname_idx)
                               found.append((aname, dtype, dval, a + 16))
-                              if verbose:
-                                  print('  uses-sdk / %s = %s (type=0x%02x)' % (aname, dval, dtype))
                   off += csize
               return found
 
-          def dump(apk):
-              with zipfile.ZipFile(apk) as z:
-                  data = z.read('AndroidManifest.xml')
-              print('AndroidManifest.xml 大小: %d 字节' % len(data))
-              print('uses-sdk 属性:')
+          def show(data, title):
+              print(title)
               res = scan(data)
               if not res:
                   print('  (没有找到 uses-sdk 元素)')
+              for aname, dtype, dval, pos in res:
+                  print('  uses-sdk / %s = %d (type=0x%02x offset=%d)' % (aname, dval, dtype, pos))
               return res
 
-          def patch(apk, out, sdk):
-              with zipfile.ZipFile(apk) as z:
-                  data = bytearray(z.read('AndroidManifest.xml'))
-                  print('原始 uses-sdk:')
-                  res = scan(data)
-                  if not res:
-                      print('  (没有找到 uses-sdk 元素，无法修改)')
-                      sys.exit(1)
-                  hit = False
-                  for aname, dtype, dval, pos in res:
-                      if aname == 'minSdkVersion':
-                          struct.pack_into('<I', data, pos, sdk)
-                          hit = True
-                  if not hit:
-                      print('  没有 minSdkVersion 属性')
-                      sys.exit(1)
-                  print('已把 minSdkVersion 改为 %d' % sdk)
-                  print('修改后 uses-sdk:')
-                  scan(data)
+          if len(sys.argv) < 3:
+              sys.exit('用法: python3 axml.py dump|patch <AndroidManifest.xml> [sdk]')
 
-                  with zipfile.ZipFile(out, 'w') as zo:
-                      skipped = 0
-                      for info in z.infolist():
-                          name = info.filename
-                          base = name.split('/')[-1].upper()
-                          if name.startswith('META-INF/') and (
-                                  base == 'MANIFEST.MF' or base.endswith('.SF')
-                                  or base.endswith('.RSA') or base.endswith('.DSA')
-                                  or base.endswith('.EC')):
-                              skipped += 1
-                              continue
-                          blob = z.read(info.filename)
-                          if info.filename == 'AndroidManifest.xml':
-                              blob = bytes(data)
-                          ni = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-                          ni.compress_type = info.compress_type
-                          ni.external_attr = info.external_attr
-                          zo.writestr(ni, blob)
-                      print('已剔除旧签名文件 %d 个' % skipped)
-              print('已输出: %s' % out)
+          cmd = sys.argv[1]
+          path = sys.argv[2]
+          data = bytearray(open(path, 'rb').read())
+          print('文件: %s (%d 字节)' % (path, len(data)))
+          res = show(data, '当前 uses-sdk:')
+          if cmd == 'dump':
+              if not res:
+                  sys.exit('错误: 没解析到 uses-sdk 元素')
+              sys.exit(0)
 
-          if __name__ == '__&#8203;main__':
-              cmd = sys.argv[1]
-              if cmd == 'dump':
-                  dump(sys.argv[2])
-              elif cmd == 'patch':
-                  patch(sys.argv[2], sys.argv[3], int(sys.argv[4]))
-              else:
-                  sys.exit('unknown cmd')
+          sdk = int(sys.argv[3])
+          hit = 0
+          for aname, dtype, dval, pos in res:
+              if aname == 'minSdkVersion' and dtype == 0x10:
+                  struct.pack_into('<I', data, pos, sdk)
+                  hit += 1
+          if not hit:
+              sys.exit('错误: 没找到 minSdkVersion 整型属性')
+          show(data, '修改后 uses-sdk:')
+          open(path, 'wb').write(bytes(data))
+          print('已写回 %s -> minSdkVersion=%d' % (path, sdk))
           PY
-          python3 -c "import ast; ast.parse(open('axml.py',encoding='utf-8').read()); print('脚本语法 OK')"
+          echo "--- 语法检查 ---"
+          python3 -c "import ast; ast.parse(open('axml.py',encoding='utf-8').read()); print('axml.py 语法 OK')"
+          echo "--- 冒烟测试（必须能打印出 uses-sdk 属性）---"
+          python3 axml.py dump apk/AndroidManifest.xml
 
-      - name: 查看原始 minSdkVersion
-        run: python3 axml.py dump original.apk
-
-      - name: 修改 minSdkVersion
-        run: python3 axml.py patch original.apk patched.apk "${MIN_SDK}"
-
-      - name: 对齐与签名
+      - name: 4-改minSdkVersion并重新打包
         run: |
+          python3 axml.py patch apk/AndroidManifest.xml "${MIN_SDK}" | tee /tmp/patch.log
+          grep -q "minSdkVersion = ${MIN_SDK}" /tmp/patch.log || { echo "错误: minSdkVersion 未改为 ${MIN_SDK}"; exit 1; }
+          echo "minSdkVersion 已确认改为 ${MIN_SDK}"
+
+          rm -f apk/META-INF/MANIFEST.MF apk/META-INF/*.SF apk/META-INF/*.RSA apk/META-INF/*.DSA apk/META-INF/*.EC
+          rmdir apk/META-INF 2>/dev/null || true
+          find apk -type d -empty -delete 2>/dev/null || true
+          rm -f patched.apk
+
+          cd apk
+          zip -q -r -X ../patched.apk . -x 'META-INF/*' 'resources.arsc'
+          if [ -f resources.arsc ]; then
+            zip -q -0 -X ../patched.apk resources.arsc
+          fi
+          cd ..
+
+          ls -l patched.apk
+          echo "--- 打包完整性检查 ---"
+          unzip -t patched.apk > /tmp/ziptest.log 2>&1 && echo "zip OK" || { echo "zip 损坏"; tail -20 /tmp/ziptest.log; exit 1; }
+          python3 -c "import zipfile;z=zipfile.ZipFile('patched.apk');n=z.namelist();print('条目数:',len(n));print('含 AndroidManifest.xml:', 'AndroidManifest.xml' in n)"
+
+      - name: 5-对齐与签名
+        run: |
+          OUT="koreader-android-arm-${VERSION}-android4.2.apk"
+          rm -f "$OUT" aligned.apk
+          SRC="patched.apk"
+
+          if zipalign -p -f 4 patched.apk aligned.apk; then
+            echo "zipalign OK"
+            SRC="aligned.apk"
+          else
+            echo "!! zipalign 失败，改用未对齐版本签名"
+          fi
+
           keytool -genkeypair -keystore ks.jks \
             -storepass koreader42 -keypass koreader42 \
             -alias koreader42 -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=KOReader Android 4.2 Build" > /dev/null 2>&1
+            -dname "CN=KOReader Android 4.2 Build" > /dev/null 2>&1 || echo "keystore 已存在"
 
-          OUT="koreader-android-arm-${VERSION}-android4.2.apk"
-          zipalign -p -f 4 patched.apk aligned.apk
-          apksigner sign --ks ks.jks --ks-pass pass:koreader42 --key-pass pass:koreader42 \
-            --min-sdk-version "${MIN_SDK}" --out "$OUT" aligned.apk
-          echo "=== 签名校验 ==="
-          apksigner verify --min-sdk-version "${MIN_SDK}" --verbose --print-certs "$OUT" | head -25 || true
+          if apksigner sign --ks ks.jks --ks-pass pass:koreader42 --key-pass pass:koreader42 \
+               --min-sdk-version "${MIN_SDK}" --out "$OUT" "$SRC"; then
+            echo "=== apksigner 完成 ==="
+            apksigner verify --min-sdk-version "${MIN_SDK}" --verbose "$OUT" | head -20 || true
+          else
+            echo "!! apksigner 失败，退回 jarsigner"
+            rm -f "$OUT"
+            jarsigner -keystore ks.jks -storepass koreader42 -keypass koreader42 \
+              -sigalg SHA1withRSA -digestalg SHA-256 -signedjar "$OUT" "$SRC" koreader42
+          fi
+
           echo "=== 最终 APK ==="
           ls -lh "$OUT"
 
-      - name: 复检最终 APK 的 minSdkVersion
-        run: python3 axml.py dump koreader-android-arm-*-android4.2.apk
+      - name: 6-复检最终APK
+        run: |
+          OUT=$(ls koreader-android-arm-*-android4.2.apk | head -1)
+          rm -rf verify && mkdir -p verify
+          unzip -q -o "$OUT" AndroidManifest.xml -d verify
+          python3 axml.py dump verify/AndroidManifest.xml | tee /tmp/final.log
+          grep -q "minSdkVersion = ${MIN_SDK}" /tmp/final.log && echo "最终APK minSdkVersion 正确" || { echo "最终APK minSdkVersion 不对"; exit 1; }
 
-      - name: 上传 APK
+      - name: 7-上传APK
         uses: actions/upload-artifact@v4
         with:
           name: koreader-android42-${{ env.VERSION }}
